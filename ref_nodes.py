@@ -21,12 +21,14 @@ import folder_paths
 
 logger = logging.getLogger("TIR.Reference")
 
-_TAG_PATTERN = re.compile(r"<ref:([^<>:]+)(?::([^<>]*))?>", re.IGNORECASE)
-_LOOKALIKE_PATTERN = re.compile(r"<ref:[^<>]*>", re.IGNORECASE)
+_TAG_PATTERN = re.compile(
+    r'<ref:([^<>:]+)(?::((?:[^<>"]|"(?:\\.|[^"\\])*")*))?>', re.IGNORECASE
+)
+_LOOKALIKE_PATTERN = re.compile(r'<ref:(?:[^<>"]|"(?:\\.|[^"\\])*")*>', re.IGNORECASE)
 _IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif", ".gif", ".tif", ".tiff",
 }
-_KNOWN_KEYS = {"g", "e", "c", "mp", "w", "m"}
+_KNOWN_KEYS = {"g", "e", "c", "mp", "w", "m", "s", "rc", "ml", "f"}
 _WIRELESS_STORE: dict[str, dict] = {}
 _WIRELESS_LOCK = threading.Lock()
 
@@ -47,6 +49,73 @@ def _fingerprint_prompt(prompt) -> str | None:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def _split_quoted(value: str, delimiter: str) -> tuple[list[str], bool]:
+    """Split on a delimiter outside double-quoted strings; backslash escapes inside quotes."""
+    parts: list[str] = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if quoted and escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == delimiter and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return parts, quoted
+
+
+def _first_unquoted(value: str, delimiter: str) -> int:
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if quoted and escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == delimiter and not quoted:
+            return index
+    return -1
+
+
+def _option_value(key: str, value: str, log: bool) -> str | None:
+    value = value.strip()
+    if key != "rc":
+        if not value:
+            _log(log, f"[TIR Ref] 옵션 '{key}' 값이 비어 있어 무시합니다.", warning=True)
+            return None
+        if '"' in value:
+            _log(log, f"[TIR Ref] 따옴표 문자열은 rc 옵션에서만 사용할 수 있습니다: {key}", warning=True)
+            return None
+        return value
+
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        _log(log, '[TIR Ref] rc는 rc="설명 문장" 형식으로 적어야 합니다.', warning=True)
+        return None
+
+    decoded: list[str] = []
+    index = 1
+    end = len(value) - 1
+    while index < end:
+        char = value[index]
+        if char == "\\" and index + 1 < end and value[index + 1] in ('\\', '"'):
+            decoded.append(value[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            _log(log, 'rc 문자열 안의 큰따옴표는 \\"로 이스케이프해야 합니다.', warning=True)
+            return None
+        decoded.append(char)
+        index += 1
+    return "".join(decoded)
+
+
 def parse_references(text: str, log: bool = True) -> tuple[list[dict], str]:
     """Return parsed calls and text with recognized call syntax removed."""
     refs: list[dict] = []
@@ -57,25 +126,28 @@ def parse_references(text: str, log: bool = True) -> tuple[list[dict], str]:
         name = match.group(1).strip()
         options: dict[str, str] = {}
         raw_options = match.group(2) or ""
-        option_items = raw_options.split(":") if raw_options else ()
+        option_items, quote_left_open = _split_quoted(raw_options, ":") if raw_options else ([], False)
+        if quote_left_open:
+            _log(log, f"[TIR Ref] 닫히지 않은 따옴표가 있습니다: {match.group(0)}", warning=True)
         for item in option_items:
             item = item.strip()
             if not item:
                 continue
-            if item.count("=") != 1:
+            equals_at = _first_unquoted(item, "=")
+            if equals_at < 0:
                 _log(log, f"[TIR Ref] 잘못된 옵션 '{item}'을 무시합니다. (예: g=4.5)", warning=True)
                 continue
-            key, value = (part.strip() for part in item.split("=", 1))
-            key = key.lower()
+            key = item[:equals_at].strip().lower()
+            value = item[equals_at + 1:]
             if key not in _KNOWN_KEYS:
                 _log(log, f"[TIR Ref] 알 수 없는 옵션 '{key}'을 무시합니다.", warning=True)
                 continue
-            if not value:
-                _log(log, f"[TIR Ref] 옵션 '{key}' 값이 비어 있어 무시합니다.", warning=True)
+            parsed_value = _option_value(key, value, log)
+            if parsed_value is None:
                 continue
             if key in options:
                 _log(log, f"[TIR Ref] 옵션 '{key}'이 중복되어 마지막 값을 사용합니다.", warning=True)
-            options[key] = value
+            options[key] = parsed_value
 
         refs.append({"image": name, "options": options})
         spans.append(match.span())
@@ -128,13 +200,19 @@ def _correction_option(options: dict, default: str, log: bool) -> str:
 
 def _first_settings(ref: dict, log: bool) -> dict:
     options = ref["options"]
+    g = _float_option(options, "g", 4.5, 0.0, 15.0, log)
+    guidance_on = "g" in options and g != 1.0
     return {
-        "g": _float_option(options, "g", 4.5, 0.0, 20.0, log),
-        "g_explicit": "g" in options,
+        "g": g,
+        "guidance_on": guidance_on,
         "e": _float_option(options, "e", 1.0, 0.0, 1.0, log),
         "c": _correction_option(options, "apg", log),
         "mp": _float_option(options, "mp", 1.0, 0.25, 2.0, log),
         "m": _parse_mode(options, log),
+        "s": _float_option(options, "s", 0.0, -3.0, 3.0, log),
+        "rc": options.get("rc", "").strip(),
+        "ml": _parse_layout(options, log),
+        "f": _float_option(options, "f", 1.0, 0.0, 1.0, log),
     }
 
 
@@ -149,6 +227,17 @@ def _parse_mode(options: dict, log: bool) -> str:
         return "char"
     _log(log, f"[TIR Ref] 'm={value}'은 0 또는 1이어야 하므로 기본 모드 Character & Style을 사용합니다.", warning=True)
     return "cs"
+
+
+def _parse_layout(options: dict, log: bool) -> str:
+    """ml=0 -> separate, ml=1 -> stitch."""
+    value = options.get("ml", "0").strip()
+    if value == "0":
+        return "separate"
+    if value == "1":
+        return "stitch"
+    _log(log, f"[TIR Ref] 'ml={value}'은 0 또는 1이어야 하므로 기본 레이아웃 separate를 사용합니다.", warning=True)
+    return "separate"
 
 
 def _ordered_image_files(root: str, include_subfolders: bool) -> list[str]:
@@ -250,14 +339,16 @@ def _snapref_core():
     module = sys.modules.get(cls.__module__)
     if module is None:
         raise RuntimeError("SnapRef 모듈을 찾지 못했습니다. SnapRef 설치 상태를 확인하세요.")
-    required = ("_Adapter", "_adapters", "_adapter_block_map", "_encode_image", "_make_wrapper", "_make_outer", "WRAPPER_KEY")
+    required = ("_Adapter", "_adapters", "_adapter_block_map", "_encode_image", "_stitch",
+                "_make_wrapper", "_make_outer", "WRAPPER_KEY")
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise RuntimeError(f"설치된 SnapRef가 필요한 내부 기능을 제공하지 않습니다: {', '.join(missing)}")
     return module
 
 
-def _apply_snapref(model, clip, vae, refs: list[torch.Tensor], weights: list[float], adapter: str, settings: dict):
+def _apply_snapref(model, clip, vae, refs: list[torch.Tensor], weights: list[float], adapter: str,
+                   settings: dict, log: bool):
     if not any(weight > 0 for weight in weights):
         return model
     if clip is None:
@@ -270,22 +361,42 @@ def _apply_snapref(model, clip, vae, refs: list[torch.Tensor], weights: list[flo
     adapter_obj = core._adapters[adapter_path]
     core._adapter_block_map(adapter_obj.block_indices, model.get_model_object("diffusion_model"))
 
+    positive_refs = [image for image, weight in zip(refs, weights) if weight > 0]
+    positive_weights = [float(weight) for weight in weights if weight > 0]
+    if settings["ml"] == "stitch" and len(positive_refs) > 1:
+        _log(log, (
+            f"[TIR Ref] ml=1(stitch): 이미지별 w 값은 무시하고 "
+            f"{len(positive_refs)}장을 하나로 합쳐 기본 가중치 1로 적용합니다."
+        ), warning=True)
+        positive_refs = [core._stitch(positive_refs)]
+        positive_weights = [1.0]
+
     kept_refs, kept_weights = [], []
-    for image, weight in zip(refs, weights):
-        if weight <= 0:
-            continue
+    for image, weight in zip(positive_refs, positive_weights):
         latent, _size = core._encode_image(model, vae, image, settings["mp"])
         kept_refs.append(latent)
         kept_weights.append(float(weight))
     if not kept_refs:
         return model
 
-    ref_cond = clip.encode_from_tokens_scheduled(clip.tokenize(""))[0]
+    ref_cond = clip.encode_from_tokens_scheduled(clip.tokenize(settings["rc"]))[0]
+    uncond_bias = None
+    if settings["f"] < 1.0 and not settings["guidance_on"]:
+        uncond_bias = math.log(max(1.0 - float(settings["f"]), 1e-6))
     patched = model.clone()
     patched.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
         core.WRAPPER_KEY,
-        core._make_wrapper(adapter_obj, kept_refs, ref_cond, settings["m"], False, 0.0, kept_weights, None),
+        core._make_wrapper(
+            adapter_obj,
+            kept_refs,
+            ref_cond,
+            settings["m"],
+            settings["guidance_on"],
+            settings["s"],
+            kept_weights,
+            uncond_bias,
+        ),
     )
     wrappers = patched.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
     patched.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {
@@ -297,7 +408,7 @@ def _apply_snapref(model, clip, vae, refs: list[torch.Tensor], weights: list[flo
         core._make_outer(adapter_obj),
     )
 
-    if settings["g_explicit"] and settings["g"] != 1.0:
+    if settings["guidance_on"]:
         if not hasattr(core, "_make_ref_guidance"):
             raise RuntimeError("설치된 SnapRef에서 ref_guidance 기능을 찾지 못했습니다.")
         patched.set_model_sampler_post_cfg_function(core._make_ref_guidance(settings["g"], settings["c"], settings["e"]))
@@ -311,7 +422,7 @@ def _apply_stack(model, vae, clip, ref_stack: list[dict], reference_folder: str,
 
     first = ref_stack[0]
     settings = _first_settings(first, log)
-    accepted_first_options = {"g", "e", "c", "mp", "w", "m"}
+    accepted_first_options = {"g", "e", "c", "mp", "w", "m", "s", "rc", "ml", "f"}
     unsupported_first = set(first["options"]) - accepted_first_options
     if unsupported_first:
         _log(log, f"[TIR Ref] 사용할 수 없는 첫 호출 옵션 {', '.join(sorted(unsupported_first))}을 무시합니다.", warning=True)
@@ -359,7 +470,7 @@ def _apply_stack(model, vae, clip, ref_stack: list[dict], reference_folder: str,
 
     if not adapter:
         raise RuntimeError("SnapRef 어댑터를 Receiver에서 선택하세요.")
-    out_model = _apply_snapref(model, clip, vae, images, weights, adapter, settings)
+    out_model = _apply_snapref(model, clip, vae, images, weights, adapter, settings, log)
 
     applied_count = sum(weight > 0 for weight in weights)
     _log(log, f"[TIR Ref] SnapRef 레퍼런스 {applied_count}개 적용 완료.")
