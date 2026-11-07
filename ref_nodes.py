@@ -217,15 +217,14 @@ def _first_settings(ref: dict, log: bool) -> dict:
 
 
 def _parse_mode(options: dict, log: bool) -> str:
-    """m=0 -> Character & Style (cs), m=1 -> Character (char)."""
+    """m=0 -> Character & Style (cs), m=1 -> Character (char), m=2 -> Style."""
     if "m" not in options:
         return "cs"
     value = options["m"].strip()
-    if value == "0":
-        return "cs"
-    if value == "1":
-        return "char"
-    _log(log, f"[TIR Ref] 'm={value}'은 0 또는 1이어야 하므로 기본 모드 Character & Style을 사용합니다.", warning=True)
+    modes = {"0": "cs", "1": "char", "2": "style"}
+    if value in modes:
+        return modes[value]
+    _log(log, f"[TIR Ref] 'm={value}'은 0, 1, 2 중 하나여야 하므로 기본 모드 Character & Style을 사용합니다.", warning=True)
     return "cs"
 
 
@@ -359,6 +358,11 @@ def _apply_snapref(model, clip, vae, refs: list[torch.Tensor], weights: list[flo
     if adapter_path not in core._adapters:
         core._adapters[adapter_path] = core._Adapter(adapter_path)
     adapter_obj = core._adapters[adapter_path]
+    if settings["m"] == "style" and "style" not in adapter_obj.modes:
+        raise RuntimeError(
+            "m=2(Style)을 적용할 수 없습니다. Style 모드 지원 어댑터가 필요합니다. "
+            f"선택한 어댑터의 지원 모드: {', '.join(adapter_obj.modes)}"
+        )
     core._adapter_block_map(adapter_obj.block_indices, model.get_model_object("diffusion_model"))
 
     positive_refs = [image for image, weight in zip(refs, weights) if weight > 0]
